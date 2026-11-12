@@ -1,0 +1,56 @@
+# ═══════════════════════════════════════════════════════════════
+#  Pingix Deploy — déploiement zero-downtime
+# ═══════════════════════════════════════════════════════════════
+APP_PATH="{{ path }}"
+RELEASE="{{ release }}"
+RELEASE_DIR="$APP_PATH/releases/$RELEASE"
+ACTIVATED=0
+
+# Si une étape échoue avant la bascule, on supprime la release à moitié construite.
+# Le site continue de tourner sur l'ancienne version.
+trap '[ "$ACTIVATED" = 1 ] || { echo "✗ Échec : release $RELEASE annulée, le site n est pas touché"; rm -rf "$RELEASE_DIR"; }' EXIT
+
+echo "→ Release $RELEASE ({{ branch }})"
+{{ agent_check }}
+git clone -q --depth 1 --branch "{{ branch }}" "{{ repository }}" "$RELEASE_DIR"
+cd "$RELEASE_DIR"
+git rev-parse HEAD > REVISION
+rm -rf .git
+
+echo "→ Fichiers partagés"
+ln -sfn "$APP_PATH/shared/.env" .env
+rm -rf storage
+ln -sfn "$APP_PATH/shared/storage" storage
+
+echo "→ Composer"
+composer install --no-dev --prefer-dist --optimize-autoloader --no-interaction --no-progress
+
+if [ -f package.json ]; then
+  echo "→ Assets"
+  if [ -f package-lock.json ]; then npm ci --no-audit --no-fund; else npm install --no-audit --no-fund; fi
+  npm run build
+  rm -rf node_modules
+fi
+
+echo "→ Migrations"
+php artisan migrate --force
+php artisan storage:link >/dev/null 2>&1 || true
+php artisan optimize
+
+{{ before_activate }}
+
+echo "→ Activation"
+ln -sfn "$RELEASE_DIR" "$APP_PATH/current_tmp"
+mv -Tf "$APP_PATH/current_tmp" "$APP_PATH/current"
+ACTIVATED=1
+
+sudo /usr/bin/systemctl reload php{{ php }}-fpm
+{{ restart_workers }}
+
+{{ after_activate }}
+
+echo "→ Nettoyage des anciennes releases"
+cd "$APP_PATH/releases"
+ls -1 | sort -r | tail -n +{{ keep_from }} | xargs -r rm -rf
+
+echo "✓ Déployé : $RELEASE ($(cut -c1-7 "$RELEASE_DIR/REVISION"))"

@@ -1,0 +1,120 @@
+# ═══════════════════════════════════════════════════════════════
+#  Pingix Deploy — provisioning de « {{ app }} »
+#  Idempotent : peut être relancé sans rien casser.
+# ═══════════════════════════════════════════════════════════════
+export DEBIAN_FRONTEND=noninteractive
+cd /tmp
+
+# ── 1. Paquets ─────────────────────────────────────────────────
+echo "→ Paquets système"
+apt-get update -q
+apt-get install -y -q software-properties-common curl git unzip
+add-apt-repository -y ppa:ondrej/php
+apt-get update -q
+apt-get install -y -q nginx redis-server supervisor postgresql certbot python3-certbot-nginx \
+  php{{ php }}-fpm php{{ php }}-cli php{{ php }}-pgsql php{{ php }}-mbstring php{{ php }}-xml \
+  php{{ php }}-curl php{{ php }}-zip php{{ php }}-bcmath php{{ php }}-intl php{{ php }}-redis php{{ php }}-gd
+
+if ! command -v composer >/dev/null 2>&1; then
+  echo "→ Composer"
+  curl -sS https://getcomposer.org/installer | php -- --install-dir=/usr/local/bin --filename=composer
+fi
+
+if ! command -v node >/dev/null 2>&1; then
+  echo "→ Node.js {{ node }}"
+  curl -fsSL https://deb.nodesource.com/setup_{{ node }}.x | bash -
+  apt-get install -y -q nodejs
+fi
+
+# ── 2. Utilisateur de déploiement ──────────────────────────────
+echo "→ Utilisateur {{ user }}"
+id {{ user }} >/dev/null 2>&1 || useradd -m -s /bin/bash {{ user }}
+mkdir -p /home/{{ user }}/.ssh
+cp {{ provision_home }}/.ssh/authorized_keys /home/{{ user }}/.ssh/authorized_keys
+[ -f /home/{{ user }}/.ssh/known_hosts ] || ssh-keyscan -H github.com gitlab.com bitbucket.org > /home/{{ user }}/.ssh/known_hosts 2>/dev/null
+chown -R {{ user }}:{{ user }} /home/{{ user }}/.ssh
+chmod 700 /home/{{ user }}/.ssh
+chmod 600 /home/{{ user }}/.ssh/authorized_keys
+
+# Droits sudo limités au strict nécessaire pour les déploiements
+cat > /etc/sudoers.d/{{ user }}-{{ app }} <<'SUDO'
+{{ user }} ALL=(root) NOPASSWD: /usr/bin/systemctl reload php{{ php }}-fpm, /usr/bin/supervisorctl
+SUDO
+chmod 440 /etc/sudoers.d/{{ user }}-{{ app }}
+visudo -cf /etc/sudoers.d/{{ user }}-{{ app }} >/dev/null
+
+if [ "{{ deploy_key }}" = "1" ] && [ ! -f /home/{{ user }}/.ssh/id_ed25519 ]; then
+  sudo -u {{ user }} ssh-keygen -q -t ed25519 -N "" -C "{{ app }}@$(hostname)" -f /home/{{ user }}/.ssh/id_ed25519
+fi
+
+# PHP-FPM tourne avec l'utilisateur deploy → pas de soucis de permissions sur storage/
+sed -i 's/^user = .*/user = {{ user }}/; s/^group = .*/group = {{ user }}/' /etc/php/{{ php }}/fpm/pool.d/www.conf
+systemctl restart php{{ php }}-fpm
+
+# ── 3. Dossiers ────────────────────────────────────────────────
+echo "→ Dossiers {{ path }}"
+mkdir -p {{ path }}/releases \
+  {{ path }}/shared/storage/app/public \
+  {{ path }}/shared/storage/framework/cache/data \
+  {{ path }}/shared/storage/framework/sessions \
+  {{ path }}/shared/storage/framework/views \
+  {{ path }}/shared/storage/logs
+chown -R {{ user }}:{{ user }} {{ path }}
+
+# ── 4. Base de données + .env ──────────────────────────────────
+echo "→ PostgreSQL ({{ db }})"
+if [ "$(sudo -u postgres psql -tAc "SELECT 1 FROM pg_roles WHERE rolname='{{ db }}'")" != "1" ]; then
+  sudo -u postgres psql -qc "CREATE USER {{ db }} WITH PASSWORD '{{ db_password }}';"
+fi
+if [ "$(sudo -u postgres psql -tAc "SELECT 1 FROM pg_database WHERE datname='{{ db }}'")" != "1" ]; then
+  sudo -u postgres createdb -O {{ db }} {{ db }}
+fi
+
+if [ ! -s {{ path }}/shared/.env ]; then
+  echo "→ Création du .env de production"
+  cat > {{ path }}/shared/.env <<'ENV'
+{{ env }}
+ENV
+  # Le .env est nouveau : on aligne le mot de passe de la base dessus
+  sudo -u postgres psql -qc "ALTER USER {{ db }} WITH PASSWORD '{{ db_password }}';"
+  chown {{ user }}:{{ user }} {{ path }}/shared/.env
+  chmod 600 {{ path }}/shared/.env
+fi
+
+# ── 5. Nginx ───────────────────────────────────────────────────
+echo "→ Nginx"
+cat > /etc/nginx/sites-available/{{ app }} <<'NGINX'
+{{ nginx }}
+NGINX
+ln -sf /etc/nginx/sites-available/{{ app }} /etc/nginx/sites-enabled/{{ app }}
+rm -f /etc/nginx/sites-enabled/default
+nginx -t
+systemctl reload nginx
+
+# ── 6. SSL ─────────────────────────────────────────────────────
+echo "→ SSL"
+{{ ssl }}
+
+# ── 7. Workers (Supervisor) ────────────────────────────────────
+echo "→ Supervisor"
+cat > /etc/supervisor/conf.d/{{ app }}-worker.conf <<'SUP'
+{{ supervisor }}
+SUP
+supervisorctl reread
+supervisorctl update
+
+# ── 8. Scheduler (cron) ────────────────────────────────────────
+echo "→ Cron"
+cat > /etc/cron.d/{{ app }} <<'CRON'
+* * * * * {{ user }} cd {{ path }}/current && php artisan schedule:run >> /dev/null 2>&1
+CRON
+chmod 644 /etc/cron.d/{{ app }}
+
+echo ""
+echo "✓ Serveur prêt pour {{ app }}"
+
+if [ "{{ deploy_key }}" = "1" ]; then
+  echo ""
+  echo "═══ DEPLOY KEY — à ajouter dans GitHub > Settings > Deploy keys ═══"
+  cat /home/{{ user }}/.ssh/id_ed25519.pub
+fi

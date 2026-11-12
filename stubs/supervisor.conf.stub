@@ -1,0 +1,13 @@
+[program:{{ app }}-worker]
+process_name=%(program_name)s_%(process_num)02d
+command=php {{ path }}/current/artisan {{ command }}
+directory={{ path }}/current
+user={{ user }}
+numprocs={{ numprocs }}
+autostart=true
+autorestart=true
+stopasgroup=true
+killasgroup=true
+stopwaitsecs=3600
+redirect_stderr=true
+stdout_logfile={{ path }}/shared/storage/logs/worker.log

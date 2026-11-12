@@ -1,0 +1,27 @@
+# ═══════════════════════════════════════════════════════════════
+#  Pingix Deploy — rollback
+# ═══════════════════════════════════════════════════════════════
+APP_PATH="{{ path }}"
+CURRENT="$(basename "$(readlink -f "$APP_PATH/current")")"
+TARGET="{{ target }}"
+
+if [ -z "$TARGET" ]; then
+  # La release juste avant celle en cours (les noms sont des dates, donc triables)
+  TARGET="$(ls -1 "$APP_PATH/releases" | sort | awk -v c="$CURRENT" '$0 == c { print prev; exit } { prev = $0 }')"
+fi
+
+if [ -z "$TARGET" ] || [ ! -d "$APP_PATH/releases/$TARGET" ]; then
+  echo "✗ Aucune release cible trouvée. Releases disponibles :"
+  ls -1 "$APP_PATH/releases"
+  exit 1
+fi
+
+echo "→ $CURRENT ⇒ $TARGET"
+ln -sfn "$APP_PATH/releases/$TARGET" "$APP_PATH/current_tmp"
+mv -Tf "$APP_PATH/current_tmp" "$APP_PATH/current"
+
+cd "$APP_PATH/current"
+sudo /usr/bin/systemctl reload php{{ php }}-fpm
+{{ restart_workers }}
+
+echo "✓ Rollback vers $TARGET (attention : les migrations ne sont pas annulées)"
